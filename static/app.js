@@ -7,7 +7,7 @@ class VideoTranscriber {
     this.currentTaskId  = null;
     this.eventSource    = null;
     this.apiBase        = '/api';
-    this.currentLang    = 'en';
+    this.currentLang    = 'zh';
 
     /* Smart progress simulation */
     this.sp = {
@@ -121,7 +121,7 @@ class VideoTranscriber {
     this._initElements();
     this._bindEvents();
     this._loadSettings();
-    this._switchLang('en');
+    this._switchLang('zh');
   }
 
   /* ── Elements ─────────────────────────────────────────── */
