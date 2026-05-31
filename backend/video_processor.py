@@ -4,6 +4,8 @@ import shutil
 import uuid
 import asyncio
 import subprocess
+import json
+import urllib.request
 import yt_dlp
 import logging
 from pathlib import Path
@@ -58,7 +60,7 @@ class VideoProcessor:
         await asyncio.to_thread(_run)
         return str(out_path)
     
-    async def fetch_subtitles(self, url: str, output_dir: Path) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    async def fetch_subtitles(self, url: str, output_dir: Path, cookies_file: Optional[str] = None) -> tuple[Optional[str], Optional[str], Optional[str]]:
         """
         先尝试从平台获取字幕文本，比下载音频快得多。
 
@@ -75,6 +77,8 @@ class VideoProcessor:
         try:
             # 1. 快速探测：获取视频信息和字幕可用性，不下载任何内容
             check_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+            if cookies_file:
+                check_opts["cookiefile"] = cookies_file
             with yt_dlp.YoutubeDL(check_opts) as ydl:
                 info = await asyncio.to_thread(ydl.extract_info, url, False)
 
@@ -82,11 +86,18 @@ class VideoProcessor:
             manual_subs: dict = info.get("subtitles") or {}
             auto_caps: dict = info.get("automatic_captions") or {}
 
-            # 过滤掉 live_chat 等非语音轨道
-            manual_langs = [k for k in manual_subs if not k.startswith("live_chat")]
-            auto_langs = [k for k in auto_caps if not k.startswith("live_chat")]
+            # 过滤掉 live_chat、danmaku 等非语音轨道
+            _non_speech = ("live_chat", "danmaku")
+            manual_langs = [k for k in manual_subs if not k.startswith(_non_speech)]
+            auto_langs = [k for k in auto_caps if not k.startswith(_non_speech)]
 
             if not manual_langs and not auto_langs:
+                # Bilibili fallback: try direct API for AI subtitles
+                if "bilibili.com" in url:
+                    logger.info(f"yt-dlp 无字幕，尝试 Bilibili AI 字幕 API")
+                    bili_result = await self._fetch_bilibili_ai_subtitles(url, output_dir, cookies_file)
+                    if bili_result[0]:
+                        return bili_result
                 logger.info(f"视频无可用字幕: {url}")
                 return None, video_title, None
 
@@ -94,10 +105,10 @@ class VideoProcessor:
             prefer_manual = bool(manual_langs)
             candidate_langs = manual_langs if prefer_manual else auto_langs
 
-            # 按优先级选语言：英语 > 简体中文 > 繁体中文 > 其他（取第一个）
+            # 按优先级选语言，子串匹配兼容 Bilibili 的 zh-CN、ai-zh 等代码
             _priority = ["en", "en-orig", "zh-Hans", "zh-Hant", "zh", "ja", "ko", "fr", "de", "es"]
             prefer_lang = next(
-                (lang for lang in _priority if lang in candidate_langs),
+                (c for p in _priority for c in candidate_langs if p.lower() in c.lower()),
                 candidate_langs[0],
             )
             logger.info(
@@ -118,12 +129,19 @@ class VideoProcessor:
                 "no_warnings": True,
                 "noplaylist": True,
             }
+            if cookies_file:
+                dl_opts["cookiefile"] = cookies_file
             with yt_dlp.YoutubeDL(dl_opts) as ydl:
                 await asyncio.to_thread(ydl.download, [url])
 
             # 3. 查找下载的字幕文件
             sub_files = list(sub_dir.glob("*.vtt")) + list(sub_dir.glob("*.srt"))
             if not sub_files:
+                if "bilibili.com" in url:
+                    logger.info("yt-dlp 字幕文件未找到，尝试 Bilibili AI 字幕 API")
+                    bili_result = await self._fetch_bilibili_ai_subtitles(url, output_dir, cookies_file)
+                    if bili_result[0]:
+                        return bili_result
                 logger.warning("字幕下载后未找到文件，回退音频模式")
                 return None, video_title, None
 
@@ -157,6 +175,148 @@ class VideoProcessor:
                     shutil.rmtree(str(sub_dir))
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------
+    # Bilibili AI 字幕直接 API 获取
+    # ------------------------------------------------------------------
+
+    async def _fetch_bilibili_ai_subtitles(self, url: str, output_dir: Path, cookies_file: Optional[str] = None) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """绕过 yt-dlp，直接调用 B站 API 获取 AI 字幕（需要登录 cookie）。"""
+        import re as _re
+        try:
+            # 提取 BV 号
+            bv_match = _re.search(r"BV[a-zA-Z0-9]+", url)
+            if not bv_match:
+                return None, None, None
+            bvid = bv_match.group(0)
+
+            # 先用 yt-dlp 获取 cid（不需要 cookie）
+            check_opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+            with yt_dlp.YoutubeDL(check_opts) as ydl:
+                info = await asyncio.to_thread(ydl.extract_info, url, False)
+            video_title = info.get("title", bvid)
+            cid = None
+            for fmt in info.get("formats", []):
+                url_part = fmt.get("url", "")
+                cid_match = _re.search(r"/(\d{10,})/", url_part)
+                if cid_match:
+                    cid = cid_match.group(1)
+                    break
+            if not cid:
+                logger.info("无法获取 cid，跳过 Bilibili AI 字幕")
+                return None, video_title, None
+
+            # 加载 cookies
+            cookie_jar = None
+            if cookies_file:
+                try:
+                    import http.cookiejar
+                    cookie_jar = http.cookiejar.MozillaCookieJar()
+                    cookie_jar.load(cookies_file, ignore_discard=True, ignore_expires=True)
+                except Exception as e:
+                    logger.warning(f"加载 Cookie 文件失败: {e}")
+
+            if not cookie_jar:
+                # 尝试从浏览器自动提取
+                cookie_jar = self._extract_browser_cookies()
+
+            if not cookie_jar:
+                logger.info("无可用的 Bilibili Cookie，跳过 AI 字幕")
+                return None, video_title, None
+
+            # 调用 B站播放器 API
+            import urllib.request as _urllib
+            from http.cookiejar import CookieJar
+
+            api_url = f"https://api.bilibili.com/x/player/wbi/v2?bvid={bvid}&cid={cid}"
+            req = _urllib.Request(api_url, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Referer": f"https://www.bilibili.com/video/{bvid}/",
+            })
+            opener = _urllib.build_opener(_urllib.HTTPCookieProcessor(cookie_jar))
+            raw = await asyncio.to_thread(opener.open, req)
+            data = json.loads(raw.read())
+
+            subs = data.get("data", {}).get("subtitle", {}).get("subtitles", [])
+            if not subs:
+                logger.info("B站 API 返回空字幕列表")
+                return None, video_title, None
+
+            # 按优先级选语言：ai-zh > zh-CN > ai-en > en-US
+            _lang_priority = ["ai-zh", "zh-CN", "zh", "ai-en", "en-US", "en"]
+            selected = next(
+                (s for lang in _lang_priority for s in subs if s.get("lan") == lang),
+                subs[0],
+            )
+            selected_lang = selected["lan"]
+            logger.info(f"Bilibili AI 字幕选中: {selected_lang}")
+
+            # 下载字幕 JSON
+            sub_url = selected.get("subtitle_url", "")
+            if sub_url.startswith("//"):
+                sub_url = "https:" + sub_url
+            sub_req = _urllib.Request(sub_url, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Referer": f"https://www.bilibili.com/video/{bvid}/",
+            })
+            sub_raw = await asyncio.to_thread(opener.open, sub_req)
+            sub_data = json.loads(sub_raw.read())
+
+            # 转为本项目格式
+            entries = []
+            seen = set()
+            for item in sub_data.get("body", []):
+                start_sec = float(item.get("from", 0))
+                end_sec = float(item.get("to", 0))
+                text = item.get("content", "").strip()
+                if not text or text in seen:
+                    continue
+                seen.add(text)
+                start_str = f"{int(start_sec // 60):02d}:{int(start_sec % 60):02d}"
+                end_str = f"{int(end_sec // 60):02d}:{int(end_sec % 60):02d}"
+                entries.append({"start": start_str, "end": end_str, "text": text})
+
+            if not entries:
+                logger.warning("Bilibili AI 字幕解析为空")
+                return None, video_title, None
+
+            # 映射语言代码为友好名称
+            lang_map = {
+                "ai-zh": "zh", "zh-CN": "zh", "zh": "zh",
+                "ai-en": "en", "en-US": "en", "en": "en",
+            }
+            file_lang = lang_map.get(selected_lang, selected_lang)
+
+            formatted = self._format_subtitle_entries(entries, file_lang)
+            logger.info(f"Bilibili AI 字幕获取成功: lang={selected_lang}, {len(entries)} 条目")
+            return formatted, video_title, file_lang
+
+        except Exception as e:
+            logger.warning(f"Bilibili AI 字幕获取失败: {e}")
+            return None, None, None
+
+    @staticmethod
+    def _extract_browser_cookies():
+        """从浏览器提取 Bilibili cookies。"""
+        try:
+            from yt_dlp.cookies import extract_cookies_from_browser
+            browsers = ["chrome", "safari", "firefox", "edge"]
+            for browser in browsers:
+                try:
+                    cj = extract_cookies_from_browser(browser)
+                    # 检查是否有 Bilibili cookie
+                    has_sessdata = any(
+                        "bilibili" in c.domain and c.name == "SESSDATA"
+                        for c in cj
+                    )
+                    if has_sessdata:
+                        logger.info(f"从 {browser} 提取到 Bilibili cookies")
+                        return cj
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
 
     # ------------------------------------------------------------------
     # 字幕解析辅助方法

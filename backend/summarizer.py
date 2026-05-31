@@ -86,6 +86,23 @@ class Summarizer:
             logger.info("返回原始转录文本")
             return raw_transcript
 
+    @staticmethod
+    def _is_llm_refusal(text: str) -> bool:
+        """Detect if LLM response is a refusal/meta-response instead of actual content."""
+        if not text or len(text.strip()) < 50:
+            return True
+        refusal_markers = [
+            "没有提供", "未提供", "未包含", "仅包含元数据", "不包含",
+            "无法进行", "无法为您", "请您提供", "请提供完整", "请上传",
+            "并没有", "元信息", "请将", "粘贴出来", "按照要求",
+            "转录文本", "音频转写", "音频内容", "有效内容",
+            "No audio", "No transcript", "I cannot", "I can't",
+        ]
+        lower = text.lower()
+        count = sum(1 for m in refusal_markers if m.lower() in lower)
+        return count >= 2
+
+
     def _estimate_tokens(self, text: str) -> int:
         """
         改进的token数量估算算法
@@ -123,7 +140,7 @@ class Summarizer:
 1. **严格保持原始语言({lang_instruction})，绝对不要翻译成其他语言**
 2. **完全移除所有时间戳标记（如 [00:00 - 00:05]）**
 3. **智能识别和重组被时间戳拆分的完整句子**，语法上不完整的句子片段需要与上下文合并
-4. 修正明显的错别字和语法错误
+4. 修正明显的错别字、语法错误和语义错误（尤其是同音字和领域术语的书写错误，需根据上下文推断正确含义）
 5. 将重组后的完整句子按照语义和逻辑含义分成自然的段落
 6. 段落之间用空行分隔
 7. **严格保持原意不变，不要添加或删除实际内容**
@@ -183,7 +200,11 @@ class Summarizer:
             temperature=0.1
         )
         
-        return strip_llm_artifacts(response.choices[0].message.content or "")
+        result = strip_llm_artifacts(response.choices[0].message.content or "")
+        if self._is_llm_refusal(result):
+            logger.warning("LLM 返回拒绝或元响应，回退原始文本")
+            return raw_transcript
+        return result
 
     async def _optimize_with_chunks(self, raw_transcript: str, max_tokens: int) -> str:
         """
@@ -207,7 +228,7 @@ class Summarizer:
 
 简单优化要求：
 1. **严格保持原始语言({lang_instruction})**，绝对不翻译
-2. **仅修正明显的错别字和语法错误**
+2. **仅修正明显的错别字、语法错误和语义错误**（尤其是同音字和领域术语的书写错误，需根据上下文推断正确含义）
 3. **稍微调整句子流畅度**，但不大幅改写
 4. **保持原文结构和长度**，不做复杂的段落重组
 5. **保持原意100%不变**
@@ -232,7 +253,12 @@ class Summarizer:
                 )
                 
                 optimized_chunk = strip_llm_artifacts(response.choices[0].message.content or "")
-                optimized_chunks.append(optimized_chunk)
+                if self._is_llm_refusal(optimized_chunk) or len(optimized_chunk.strip()) < len(chunk.strip()) * 0.05:
+                    # LLM 拒绝处理或返回空内容，回退原始文本
+                    logger.warning(f"LLM 优化返回内容过短，回退原始片段")
+                    optimized_chunks.append(chunk)
+                else:
+                    optimized_chunks.append(optimized_chunk)
                 
             except Exception as e:
                 logger.error(f"优化第 {i+1} 块失败: {e}")
@@ -319,6 +345,9 @@ class Summarizer:
                 temperature=0.1
             )
             optimized_text = strip_llm_artifacts(response.choices[0].message.content or "")
+            if self._is_llm_refusal(optimized_text):
+                logger.warning("LLM 返回拒绝或元响应，使用基础格式化")
+                return self._apply_basic_formatting(chunk_text)
             # 移除诸如 "# Transcript" / "## Transcript" 等标题
             optimized_text = self._remove_transcript_heading(optimized_text)
             enforced = self._enforce_paragraph_max_chars(optimized_text.strip(), max_chars=400)
@@ -517,7 +546,7 @@ class Summarizer:
             if s.startswith('# '):
                 # 跳过顶级标题（通常是视频标题，可在最终加回）
                 continue
-            if s.startswith('**检测语言:**') or s.startswith('**语言概率:**'):
+            if s.startswith('**检测语言:**') or s.startswith('**语言概率:**') or s.startswith('**Detected Language:**') or s.startswith('**Language Probability:**'):
                 continue
             kept.append(line)
         # 规范空行
@@ -627,8 +656,8 @@ class Summarizer:
             # 跳过时间戳、标题、元数据
             if (line.startswith('**[') and line.endswith(']**') or
                 line.startswith('#') or
-                line.startswith('**检测语言:**') or
-                line.startswith('**语言概率:**') or
+                line.startswith('**检测语言:**') or line.startswith('**Detected Language:**') or
+                line.startswith('**语言概率:**') or line.startswith('**Language Probability:**') or
                 not line):
                 continue
             text_lines.append(line)
@@ -691,7 +720,7 @@ class Summarizer:
             if line.strip().startswith('# ') or line.strip().startswith('## '):
                 continue
             # 跳过检测语言等元信息行
-            if line.strip().startswith('**检测语言:**') or line.strip().startswith('**语言概率:**'):
+            if line.strip().startswith('**检测语言:**') or line.strip().startswith('**语言概率:**') or line.strip().startswith('**Detected Language:**') or line.strip().startswith('**Language Probability:**'):
                 continue
             # 保留非空文本行
             if line.strip():
@@ -881,7 +910,11 @@ Core requirements:
             temperature=0.05
         )
         
-        return strip_llm_artifacts(response.choices[0].message.content or "")
+        result = strip_llm_artifacts(response.choices[0].message.content or "")
+        if self._is_llm_refusal(result):
+            logger.warning("LLM 返回拒绝或元响应，回退原始文本")
+            return raw_transcript
+        return result
 
     def _validate_paragraph_lengths(self, text: str) -> str:
         """
@@ -1009,13 +1042,29 @@ Core requirements:
         language_name = self.language_map.get(target_language, "中文（简体）")
         
         # 构建英文提示词，适用于所有目标语言
-        system_prompt = f"""You are an expert editor. Write a concise EXECUTIVE SUMMARY in {language_name} of the following material.
+        system_prompt = f"""You are an expert editor. Write a well-structured EXECUTIVE SUMMARY in {language_name} of the following material.
 
-Hard rules:
-- Length: about 180–450 words in {language_name} (use the lower end if the source is short). Never reproduce long verbatim quotes or extended sentence-by-sentence rewrites of the transcript.
-- Content: main thesis, 3–7 key takeaways, important conclusions, and critical facts or numbers only. Tight prose; short bullet lists are OK for takeaways.
-- Do NOT restate the full transcript, do NOT add preamble ("Here is…"), and do NOT add closings such as offers to revise or "let me know if…" / 客套尾注.
-- Markdown: optional `## Key takeaways` then paragraphs; avoid decorative filler headings.
+Output format (MUST follow this structure):
+
+## 核心摘要
+One paragraph (2–4 sentences) that captures the main thesis.
+
+## 关键要点
+- Key point 1 (bare markdown list items)
+- Key point 2
+- Key point 3 (3–7 items total)
+
+## 详细分析
+1–3 well-organized paragraphs in {language_name}. Each paragraph starts with a **bold topic phrase** that signals the content.
+
+## 展望 / 后续关注
+What to watch next: 1–3 specific upcoming events, data points, or open questions that will determine how the situation evolves. Forward-looking only — do NOT restate the summary.
+
+Style rules:
+- Total length: 200–600 words in {language_name}
+- Never reproduce long verbatim quotes
+- No preamble, no meta-closings, no "let me know" or "欢迎反馈"
+- Paragraphs separated by blank lines
 
 Output ONLY the summary body in {language_name}."""
 
@@ -1056,14 +1105,14 @@ Output ONLY the summary body in {language_name}."""
         for i, chunk in enumerate(chunks):
             logger.info(f"正在摘要第 {i+1}/{len(chunks)} 块...")
             
-            system_prompt = f"""You are a summarization expert. Write a brief section summary in {language_name}.
+            system_prompt = f"""You are a summarization expert. Extract key points from this transcript section in {language_name}.
 
 This is part {i+1} of {len(chunks)} of the full transcript.
 
-Rules:
-- About 80–160 words in {language_name}; bullets OK for key points.
-- Do not echo the transcript verbatim; capture only new information in this segment.
-- No preamble or meta-closings."""
+Output as a compact summary in {language_name}:
+- About 80–160 words
+- Focus on information unique to this segment
+- No preamble, no meta-closings."""
 
             user_prompt = f"""[Part {i+1}/{len(chunks)}] Summarize in {language_name} (80–160 words, tight prose):
 
@@ -1153,12 +1202,27 @@ Output content only, no headings like "Summary:"."""
         language_name = self.language_map.get(target_language, "中文（简体）")
         
         try:
-            system_prompt = f"""You integrate partial summaries into ONE concise executive summary in {language_name}.
+            system_prompt = f"""You integrate partial summaries into ONE well-structured executive summary in {language_name}.
+
+Output format (MUST follow this structure):
+
+## 核心摘要
+One paragraph (2–4 sentences) capturing the overall main thesis.
+
+## 关键要点
+- Consolidated key point (bare markdown list items)
+- Another key point (3–7 items total, covering all parts)
+
+## 详细分析
+1–3 well-organized paragraphs in {language_name}, each starting with a **bold topic phrase**.
+
+## 展望 / 后续关注
+What to watch next: 1–3 specific upcoming events, data points, or open questions. Forward-looking only — do NOT restate the summary.
 
 Rules:
-- Total length about 280–650 words in {language_name}; remove duplication, do not expand into a transcript-length rewrite.
-- Markdown: paragraphs separated by blank lines; optional `## Key takeaways` only if it adds clarity.
-- No preamble, no meta-closings (e.g. offers to revise or "let me know")."""
+- Total length: 250–650 words in {language_name}; remove duplication, do NOT expand.
+- No preamble, no meta-closings.
+- Paragraphs separated by blank lines."""
 
             user_prompt = f"""Merge the following partial summaries into one executive summary in {language_name}:
 
@@ -1174,7 +1238,11 @@ Rules:
                 temperature=0.25
             )
 
-            return strip_llm_artifacts(response.choices[0].message.content or "")
+            result = strip_llm_artifacts(response.choices[0].message.content or "")
+            if self._is_llm_refusal(result):
+                logger.warning("LLM 返回拒绝或元响应，回退原始文本")
+                return combined_summaries
+            return result
         except Exception as e:
             logger.error(f"整合摘要失败: {e}")
             # 失败时直接合并
